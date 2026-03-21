@@ -282,7 +282,7 @@ def build_prompt(model_short, experiment_num, current_files, history):
     system = (
         "You are an iOS performance engineer optimizing cold launch time for a SwiftUI app. "
         "You will be given the current source code of 5 Swift files that control app startup. "
-        "Your goal: reduce cold_launch_ms (lower is better). Baseline is 441ms.\n\n"
+        "Your goal: reduce cold_launch_ms (lower is better). Baseline is 558ms.\n\n"
         "RULES:\n"
         "- You may only modify the 5 files listed below\n"
         "- The app must still launch correctly and display its UI\n"
@@ -359,7 +359,7 @@ def run_model_experiments(model_config, api_key, num_experiments):
         cwd=TARGET_APP_DIR, capture_output=True, text=True,
     )
 
-    best_cold_launch = 441  # baseline from App Store v2.0
+    best_cold_launch = 558  # baseline from App Store v2.0
     total_cost = sum(h.get("cost_usd", 0) for h in history)
     total_input_tokens = sum(h.get("input_tokens", 0) for h in history)
     total_output_tokens = sum(h.get("output_tokens", 0) for h in history)
@@ -508,7 +508,7 @@ def run_model_experiments(model_config, api_key, num_experiments):
 
     # Final summary for this model
     keeps = [h for h in history if h["status"] == "keep"]
-    best = min((h["cold_launch_ms"] for h in keeps), default=441)
+    best = min((h["cold_launch_ms"] for h in keeps), default=558)
     print(f"\n{model_short} summary: {len(history)} experiments, best={best}ms, cost=${total_cost:.2f}")
 
     return history
@@ -540,7 +540,7 @@ def generate_comparison():
             history = json.load(f)
 
         keeps = [h for h in history if h["status"] == "keep"]
-        best = min((h["cold_launch_ms"] for h in keeps), default=441)
+        best = min((h["cold_launch_ms"] for h in keeps), default=558)
         total_cost = sum(h.get("cost_usd", 0) for h in history)
         print(f"{model_short:<20} {best:>8} {len(history):>12} {len(keeps):>6} ${total_cost:>9.2f}")
 

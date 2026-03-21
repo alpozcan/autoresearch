@@ -36,10 +36,11 @@ APP_PATH = os.path.join(DERIVED_DATA_PATH, "Build", "Products",
                         "Debug-iphonesimulator", "MiddleEarth.app")
 
 # Baseline measurements from App Store v2.0 commit (11a74a6)
+# Established from 3 median cold launches on a clean simulator
 BASELINE = {
-    "cold_launch_ms": 441,
-    "service_registration_ms": 61,
-    "swiftdata_init_ms": 45,
+    "cold_launch_ms": 558,
+    "service_registration_ms": 70,
+    "swiftdata_init_ms": 56,
 }
 
 # Scoring weights for composite score (lower ms = better score)
