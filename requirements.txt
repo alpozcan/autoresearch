@@ -1,0 +1,4 @@
+openai
+plotly
+pyyaml
+flask

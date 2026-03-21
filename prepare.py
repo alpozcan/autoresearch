@@ -1,389 +1,377 @@
 """
-One-time data preparation for autoresearch experiments.
-Downloads data shards and trains a BPE tokenizer.
+iOS app launch performance harness for autoresearch experiments.
+Builds the app, installs on simulator, measures cold launch time.
 
 Usage:
-    python prepare.py                  # full prep (download + tokenizer)
-    python prepare.py --num-shards 8   # download only 8 shards (for testing)
+    python prepare.py              # full build + measure (3 launches, median)
+    python prepare.py --runs 5     # 5 launches instead of 3
+    python prepare.py --skip-build # measure only (skip xcodebuild)
 
-Data and tokenizer are stored in ~/.cache/autoresearch/.
+This is the IMMUTABLE harness. Do not modify.
 """
 
 import os
 import sys
+import re
 import time
-import math
+import json
 import argparse
-import pickle
-from multiprocessing import Pool
-
-import requests
-import pyarrow.parquet as pq
-import rustbpe
-import tiktoken
-import torch
+import subprocess
+import statistics
 
 # ---------------------------------------------------------------------------
 # Constants (fixed, do not modify)
 # ---------------------------------------------------------------------------
 
-MAX_SEQ_LEN = 2048       # context length
-TIME_BUDGET = 300        # training time budget in seconds (5 minutes)
-EVAL_TOKENS = 40 * 524288  # number of tokens for val eval
+TARGET_PATH = "/Users/alp/Development/Apps/iOS/MiddleEarth"
+WORKSPACE = os.path.join(TARGET_PATH, "MiddleEarth.xcworkspace")
+SCHEME = "MiddleEarth"
+DEVICE_UDID = "231ABE22-DA2D-4348-AB47-781009F53A63"
+DESTINATION = "platform=iOS Simulator,name=iPhone 17 Pro,OS=26.2"
+BUNDLE_ID = "me.alp.middleearth"
+
+AUTORESEARCH_DIR = os.path.dirname(os.path.abspath(__file__))
+DERIVED_DATA_PATH = os.path.join(AUTORESEARCH_DIR, "Derived")
+APP_PATH = os.path.join(DERIVED_DATA_PATH, "Build", "Products",
+                        "Debug-iphonesimulator", "MiddleEarth.app")
+
+# Baseline measurements (established empirically)
+BASELINE = {
+    "cold_launch_ms": 558,
+    "service_registration_ms": 70,
+    "swiftdata_init_ms": 56,
+}
+
+# Scoring weights for composite score (lower ms = better score)
+SCORING_WEIGHTS = {
+    "cold_launch_ms": 0.70,
+    "service_registration_ms": 0.15,
+    "swiftdata_init_ms": 0.15,
+}
+
+# Number of measurement runs (median is taken)
+DEFAULT_RUNS = 3
+
+# Timing marker patterns in app stdout
+# Expected format: [LAUNCH T+Xms] and [REGISTRY T+Xms]
+LAUNCH_PATTERN = re.compile(r"\[LAUNCH T\+(\d+)ms\].*MainView\.onAppear")
+REGISTRY_PATTERN = re.compile(r"\[REGISTRY T\+(\d+)ms\].*All services registered")
+SWIFTDATA_PATTERN = re.compile(r"\[REGISTRY T\+(\d+)ms\].*ModelContainer created")
+
+# Files the agent is allowed to modify
+MUTABLE_FILES = [
+    "MiddleEarth/Core/DependencyInjection/AppRegistry.swift",
+    "MiddleEarth/MiddleEarthApp.swift",
+    "MiddleEarth/Views/MainView.swift",
+    "MiddleEarth/Views/Common/SplashView.swift",
+    "MiddleEarth/Services/AppBootstrapService.swift",
+]
 
 # ---------------------------------------------------------------------------
-# Configuration
+# Workspace generation
 # ---------------------------------------------------------------------------
 
-CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch")
-DATA_DIR = os.path.join(CACHE_DIR, "data")
-TOKENIZER_DIR = os.path.join(CACHE_DIR, "tokenizer")
-BASE_URL = "https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle/resolve/main"
-MAX_SHARD = 6542 # the last datashard is shard_06542.parquet
-VAL_SHARD = MAX_SHARD  # pinned validation shard (shard_06542)
-VAL_FILENAME = f"shard_{VAL_SHARD:05d}.parquet"
-VOCAB_SIZE = 8192
-
-# BPE split pattern (GPT-4 style, with \p{N}{1,2} instead of {1,3})
-SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
-
-SPECIAL_TOKENS = [f"<|reserved_{i}|>" for i in range(4)]
-BOS_TOKEN = "<|reserved_0|>"
-
-# ---------------------------------------------------------------------------
-# Data download
-# ---------------------------------------------------------------------------
-
-def download_single_shard(index):
-    """Download one parquet shard with retries. Returns True on success."""
-    filename = f"shard_{index:05d}.parquet"
-    filepath = os.path.join(DATA_DIR, filename)
-    if os.path.exists(filepath):
+def ensure_workspace():
+    """Generate Xcode workspace with Tuist if it doesn't exist."""
+    if os.path.exists(WORKSPACE):
         return True
+    print("Workspace not found, running tuist generate...")
+    result = subprocess.run(
+        ["tuist", "generate", "--no-open"],
+        cwd=TARGET_PATH,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    if result.returncode != 0:
+        print(f"tuist generate failed:\n{result.stderr}")
+        return False
+    return True
 
-    url = f"{BASE_URL}/{filename}"
-    max_attempts = 5
-    for attempt in range(1, max_attempts + 1):
-        try:
-            response = requests.get(url, stream=True, timeout=30)
-            response.raise_for_status()
-            temp_path = filepath + ".tmp"
-            with open(temp_path, "wb") as f:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        f.write(chunk)
-            os.rename(temp_path, filepath)
-            print(f"  Downloaded {filename}")
-            return True
-        except (requests.RequestException, IOError) as e:
-            print(f"  Attempt {attempt}/{max_attempts} failed for {filename}: {e}")
-            for path in [filepath + ".tmp", filepath]:
-                if os.path.exists(path):
-                    try:
-                        os.remove(path)
-                    except OSError:
-                        pass
-            if attempt < max_attempts:
-                time.sleep(2 ** attempt)
+# ---------------------------------------------------------------------------
+# Build
+# ---------------------------------------------------------------------------
+
+def build_app():
+    """Build the iOS app with xcodebuild. Returns (success, build_seconds)."""
+    if not ensure_workspace():
+        return False, 0.0
+
+    print("Building app...")
+    t0 = time.time()
+    result = subprocess.run(
+        [
+            "xcodebuild", "build",
+            "-workspace", WORKSPACE,
+            "-scheme", SCHEME,
+            "-destination", DESTINATION,
+            "-derivedDataPath", DERIVED_DATA_PATH,
+            "-quiet",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    t1 = time.time()
+    build_seconds = t1 - t0
+
+    if result.returncode != 0:
+        print(f"Build FAILED ({build_seconds:.1f}s)")
+        # Print last 30 lines of stderr for diagnostics
+        lines = result.stderr.strip().split("\n")
+        for line in lines[-30:]:
+            print(f"  {line}")
+        return False, build_seconds
+
+    print(f"Build succeeded ({build_seconds:.1f}s)")
+    return True, build_seconds
+
+# ---------------------------------------------------------------------------
+# Simulator management
+# ---------------------------------------------------------------------------
+
+def boot_simulator():
+    """Boot the target simulator if not already booted."""
+    result = subprocess.run(
+        ["xcrun", "simctl", "list", "devices", "-j"],
+        capture_output=True, text=True,
+    )
+    devices = json.loads(result.stdout)
+    for runtime, device_list in devices.get("devices", {}).items():
+        for device in device_list:
+            if device["udid"] == DEVICE_UDID:
+                if device["state"] == "Booted":
+                    return True
+                print(f"Booting simulator {device['name']}...")
+                subprocess.run(
+                    ["xcrun", "simctl", "boot", DEVICE_UDID],
+                    capture_output=True, text=True,
+                )
+                time.sleep(3)
+                return True
+    print(f"Simulator {DEVICE_UDID} not found!")
     return False
 
 
-def download_data(num_shards, download_workers=8):
-    """Download training shards + pinned validation shard."""
-    os.makedirs(DATA_DIR, exist_ok=True)
-    num_train = min(num_shards, MAX_SHARD)
-    ids = list(range(num_train))
-    if VAL_SHARD not in ids:
-        ids.append(VAL_SHARD)
+def install_app():
+    """Install the built app on the simulator."""
+    if not os.path.exists(APP_PATH):
+        print(f"App not found at {APP_PATH}")
+        return False
 
-    # Count what's already downloaded
-    existing = sum(1 for i in ids if os.path.exists(os.path.join(DATA_DIR, f"shard_{i:05d}.parquet")))
-    if existing == len(ids):
-        print(f"Data: all {len(ids)} shards already downloaded at {DATA_DIR}")
-        return
+    if not boot_simulator():
+        return False
 
-    needed = len(ids) - existing
-    print(f"Data: downloading {needed} shards ({existing} already exist)...")
+    print("Installing app on simulator...")
+    result = subprocess.run(
+        ["xcrun", "simctl", "install", DEVICE_UDID, APP_PATH],
+        capture_output=True, text=True, timeout=60,
+    )
+    if result.returncode != 0:
+        print(f"Install failed: {result.stderr}")
+        return False
+    return True
 
-    workers = max(1, min(download_workers, needed))
-    with Pool(processes=workers) as pool:
-        results = pool.map(download_single_shard, ids)
 
-    ok = sum(1 for r in results if r)
-    print(f"Data: {ok}/{len(ids)} shards ready at {DATA_DIR}")
+def terminate_app():
+    """Terminate the app if running."""
+    subprocess.run(
+        ["xcrun", "simctl", "terminate", DEVICE_UDID, BUNDLE_ID],
+        capture_output=True, text=True,
+    )
+    time.sleep(0.5)
 
 # ---------------------------------------------------------------------------
-# Tokenizer training
+# Launch measurement
 # ---------------------------------------------------------------------------
 
-def list_parquet_files():
-    """Return sorted list of parquet file paths in the data directory."""
-    files = sorted(f for f in os.listdir(DATA_DIR) if f.endswith(".parquet") and not f.endswith(".tmp"))
-    return [os.path.join(DATA_DIR, f) for f in files]
+def measure_single_launch(run_index=0):
+    """
+    Cold launch the app and parse timing markers from stdout.
+    Returns dict with timing values or None on failure.
+    """
+    terminate_app()
+    # Allow process cleanup for cold launch
+    time.sleep(2.0)
 
+    print(f"  Launch {run_index + 1}: ", end="", flush=True)
 
-def text_iterator(max_chars=1_000_000_000, doc_cap=10_000):
-    """Yield documents from training split (all shards except pinned val shard)."""
-    parquet_paths = [p for p in list_parquet_files() if not p.endswith(VAL_FILENAME)]
-    nchars = 0
-    for filepath in parquet_paths:
-        pf = pq.ParquetFile(filepath)
-        for rg_idx in range(pf.num_row_groups):
-            rg = pf.read_row_group(rg_idx)
-            for text in rg.column("text").to_pylist():
-                doc = text[:doc_cap] if len(text) > doc_cap else text
-                nchars += len(doc)
-                yield doc
-                if nchars >= max_chars:
-                    return
-
-
-def train_tokenizer():
-    """Train BPE tokenizer using rustbpe, save as tiktoken pickle."""
-    tokenizer_pkl = os.path.join(TOKENIZER_DIR, "tokenizer.pkl")
-    token_bytes_path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
-
-    if os.path.exists(tokenizer_pkl) and os.path.exists(token_bytes_path):
-        print(f"Tokenizer: already trained at {TOKENIZER_DIR}")
-        return
-
-    os.makedirs(TOKENIZER_DIR, exist_ok=True)
-
-    parquet_files = list_parquet_files()
-    if len(parquet_files) < 2:
-        print("Tokenizer: need at least 2 data shards (1 train + 1 val). Download more data first.")
-        sys.exit(1)
-
-    # --- Train with rustbpe ---
-    print("Tokenizer: training BPE tokenizer...")
-    t0 = time.time()
-
-    tokenizer = rustbpe.Tokenizer()
-    vocab_size_no_special = VOCAB_SIZE - len(SPECIAL_TOKENS)
-    tokenizer.train_from_iterator(text_iterator(), vocab_size_no_special, pattern=SPLIT_PATTERN)
-
-    # Build tiktoken encoding from trained merges
-    pattern = tokenizer.get_pattern()
-    mergeable_ranks = {bytes(k): v for k, v in tokenizer.get_mergeable_ranks()}
-    tokens_offset = len(mergeable_ranks)
-    special_tokens = {name: tokens_offset + i for i, name in enumerate(SPECIAL_TOKENS)}
-    enc = tiktoken.Encoding(
-        name="rustbpe",
-        pat_str=pattern,
-        mergeable_ranks=mergeable_ranks,
-        special_tokens=special_tokens,
+    # Launch and capture stdout via simctl
+    process = subprocess.Popen(
+        ["xcrun", "simctl", "launch", "--console-pty", DEVICE_UDID, BUNDLE_ID],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
     )
 
-    # Save tokenizer
-    with open(tokenizer_pkl, "wb") as f:
-        pickle.dump(enc, f)
+    output_lines = []
+    metrics = {}
+    start_time = time.time()
+    timeout = 30  # seconds
 
-    t1 = time.time()
-    print(f"Tokenizer: trained in {t1 - t0:.1f}s, saved to {tokenizer_pkl}")
+    try:
+        while time.time() - start_time < timeout:
+            line = process.stdout.readline()
+            if not line:
+                if process.poll() is not None:
+                    break
+                continue
+            output_lines.append(line)
 
-    # --- Build token_bytes lookup for BPB evaluation ---
-    print("Tokenizer: building token_bytes lookup...")
-    special_set = set(SPECIAL_TOKENS)
-    token_bytes_list = []
-    for token_id in range(enc.n_vocab):
-        token_str = enc.decode([token_id])
-        if token_str in special_set:
-            token_bytes_list.append(0)
+            # Parse timing markers
+            m = LAUNCH_PATTERN.search(line)
+            if m:
+                metrics["cold_launch_ms"] = int(m.group(1))
+
+            m = REGISTRY_PATTERN.search(line)
+            if m:
+                metrics["service_registration_ms"] = int(m.group(1))
+
+            m = SWIFTDATA_PATTERN.search(line)
+            if m:
+                metrics["swiftdata_init_ms"] = int(m.group(1))
+
+            # Once we have the launch marker, we're done
+            if "cold_launch_ms" in metrics:
+                break
+    except Exception as e:
+        print(f"ERROR: {e}")
+        return None
+    finally:
+        terminate_app()
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+
+    if "cold_launch_ms" not in metrics:
+        print("TIMEOUT (no timing markers found)")
+        if output_lines:
+            print("    Last 5 lines of output:")
+            for line in output_lines[-5:]:
+                print(f"      {line.rstrip()}")
+        return None
+
+    launch = metrics.get("cold_launch_ms", 0)
+    reg = metrics.get("service_registration_ms", 0)
+    swd = metrics.get("swiftdata_init_ms", 0)
+    print(f"cold={launch}ms  reg={reg}ms  swd={swd}ms")
+    return metrics
+
+
+def measure_launch(num_runs=DEFAULT_RUNS):
+    """
+    Perform multiple cold launches and return median metrics.
+    Returns (metrics_dict, all_runs) or (None, []) on failure.
+    """
+    all_runs = []
+    for i in range(num_runs):
+        result = measure_single_launch(i)
+        if result is not None:
+            all_runs.append(result)
+
+    if not all_runs:
+        return None, []
+
+    # Take median of each metric
+    median_metrics = {}
+    for key in ["cold_launch_ms", "service_registration_ms", "swiftdata_init_ms"]:
+        values = [r[key] for r in all_runs if key in r]
+        if values:
+            median_metrics[key] = int(statistics.median(values))
         else:
-            token_bytes_list.append(len(token_str.encode("utf-8")))
-    token_bytes_tensor = torch.tensor(token_bytes_list, dtype=torch.int32)
-    torch.save(token_bytes_tensor, token_bytes_path)
-    print(f"Tokenizer: saved token_bytes to {token_bytes_path}")
+            median_metrics[key] = 0
 
-    # Sanity check
-    test = "Hello world! Numbers: 123. Unicode: 你好"
-    encoded = enc.encode_ordinary(test)
-    decoded = enc.decode(encoded)
-    assert decoded == test, f"Tokenizer roundtrip failed: {test!r} -> {decoded!r}"
-    print(f"Tokenizer: sanity check passed (vocab_size={enc.n_vocab})")
+    return median_metrics, all_runs
 
 # ---------------------------------------------------------------------------
-# Runtime utilities (imported by train.py)
+# Scoring
 # ---------------------------------------------------------------------------
 
-class Tokenizer:
-    """Minimal tokenizer wrapper. Training is handled above."""
-
-    def __init__(self, enc):
-        self.enc = enc
-        self.bos_token_id = enc.encode_single_token(BOS_TOKEN)
-
-    @classmethod
-    def from_directory(cls, tokenizer_dir=TOKENIZER_DIR):
-        with open(os.path.join(tokenizer_dir, "tokenizer.pkl"), "rb") as f:
-            enc = pickle.load(f)
-        return cls(enc)
-
-    def get_vocab_size(self):
-        return self.enc.n_vocab
-
-    def get_bos_token_id(self):
-        return self.bos_token_id
-
-    def encode(self, text, prepend=None, num_threads=8):
-        if prepend is not None:
-            prepend_id = prepend if isinstance(prepend, int) else self.enc.encode_single_token(prepend)
-        if isinstance(text, str):
-            ids = self.enc.encode_ordinary(text)
-            if prepend is not None:
-                ids.insert(0, prepend_id)
-        elif isinstance(text, list):
-            ids = self.enc.encode_ordinary_batch(text, num_threads=num_threads)
-            if prepend is not None:
-                for row in ids:
-                    row.insert(0, prepend_id)
-        else:
-            raise ValueError(f"Invalid input type: {type(text)}")
-        return ids
-
-    def decode(self, ids):
-        return self.enc.decode(ids)
-
-
-def get_token_bytes(device="cpu"):
-    path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
-    with open(path, "rb") as f:
-        return torch.load(f, map_location=device)
-
-
-def _document_batches(split, tokenizer_batch_size=128):
-    """Infinite iterator over document batches from parquet files."""
-    parquet_paths = list_parquet_files()
-    assert len(parquet_paths) > 0, "No parquet files found. Run prepare.py first."
-    val_path = os.path.join(DATA_DIR, VAL_FILENAME)
-    if split == "train":
-        parquet_paths = [p for p in parquet_paths if p != val_path]
-        assert len(parquet_paths) > 0, "No training shards found."
-    else:
-        parquet_paths = [val_path]
-    epoch = 1
-    while True:
-        for filepath in parquet_paths:
-            pf = pq.ParquetFile(filepath)
-            for rg_idx in range(pf.num_row_groups):
-                rg = pf.read_row_group(rg_idx)
-                batch = rg.column('text').to_pylist()
-                for i in range(0, len(batch), tokenizer_batch_size):
-                    yield batch[i:i+tokenizer_batch_size], epoch
-        epoch += 1
-
-
-def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
+def compute_composite_score(metrics):
     """
-    BOS-aligned dataloader with best-fit packing.
-    Every row starts with BOS. Documents packed using best-fit to minimize cropping.
-    When no document fits remaining space, crops shortest doc to fill exactly.
-    100% utilization (no padding).
+    Compute composite score from metrics. Score = weighted average of
+    (baseline / measured) ratios. Higher is better. 1.0 = baseline performance.
+    Values > 1.0 mean improvement over baseline.
     """
-    assert split in ["train", "val"]
-    row_capacity = T + 1
-    batches = _document_batches(split)
-    bos_token = tokenizer.get_bos_token_id()
-    doc_buffer = []
-    epoch = 1
-
-    def refill_buffer():
-        nonlocal epoch
-        doc_batch, epoch = next(batches)
-        token_lists = tokenizer.encode(doc_batch, prepend=bos_token)
-        doc_buffer.extend(token_lists)
-
-    # Pre-allocate buffers: [inputs (B*T) | targets (B*T)]
-    row_buffer = torch.empty((B, row_capacity), dtype=torch.long)
-    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=True)
-    gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device="cuda")
-    cpu_inputs = cpu_buffer[:B * T].view(B, T)
-    cpu_targets = cpu_buffer[B * T:].view(B, T)
-    inputs = gpu_buffer[:B * T].view(B, T)
-    targets = gpu_buffer[B * T:].view(B, T)
-
-    while True:
-        for row_idx in range(B):
-            pos = 0
-            while pos < row_capacity:
-                while len(doc_buffer) < buffer_size:
-                    refill_buffer()
-
-                remaining = row_capacity - pos
-
-                # Find largest doc that fits entirely
-                best_idx = -1
-                best_len = 0
-                for i, doc in enumerate(doc_buffer):
-                    doc_len = len(doc)
-                    if doc_len <= remaining and doc_len > best_len:
-                        best_idx = i
-                        best_len = doc_len
-
-                if best_idx >= 0:
-                    doc = doc_buffer.pop(best_idx)
-                    row_buffer[row_idx, pos:pos + len(doc)] = torch.tensor(doc, dtype=torch.long)
-                    pos += len(doc)
-                else:
-                    # No doc fits — crop shortest to fill remaining
-                    shortest_idx = min(range(len(doc_buffer)), key=lambda i: len(doc_buffer[i]))
-                    doc = doc_buffer.pop(shortest_idx)
-                    row_buffer[row_idx, pos:pos + remaining] = torch.tensor(doc[:remaining], dtype=torch.long)
-                    pos += remaining
-
-        cpu_inputs.copy_(row_buffer[:, :-1])
-        cpu_targets.copy_(row_buffer[:, 1:])
-        gpu_buffer.copy_(cpu_buffer, non_blocking=True)
-        yield inputs, targets, epoch
+    score = 0.0
+    for key, weight in SCORING_WEIGHTS.items():
+        baseline_val = BASELINE[key]
+        measured_val = metrics.get(key, baseline_val)
+        if measured_val <= 0:
+            measured_val = 1  # avoid division by zero
+        ratio = baseline_val / measured_val
+        score += weight * ratio
+    return round(score, 4)
 
 # ---------------------------------------------------------------------------
-# Evaluation (DO NOT CHANGE — this is the fixed metric)
+# Full evaluation pipeline
 # ---------------------------------------------------------------------------
 
-@torch.no_grad()
-def evaluate_bpb(model, tokenizer, batch_size):
+def evaluate(num_runs=DEFAULT_RUNS, skip_build=False):
     """
-    Bits per byte (BPB): vocab size-independent evaluation metric.
-    Sums per-token cross-entropy (in nats), sums target byte lengths,
-    then converts nats/byte to bits/byte. Special tokens (byte length 0)
-    are excluded from both sums.
-    Uses fixed MAX_SEQ_LEN so results are comparable across configs.
+    Full evaluation: build, install, measure.
+    Returns dict with all metrics or None on failure.
     """
-    token_bytes = get_token_bytes(device="cuda")
-    val_loader = make_dataloader(tokenizer, batch_size, MAX_SEQ_LEN, "val")
-    steps = EVAL_TOKENS // (batch_size * MAX_SEQ_LEN)
-    total_nats = 0.0
-    total_bytes = 0
-    for _ in range(steps):
-        x, y, _ = next(val_loader)
-        loss_flat = model(x, y, reduction='none').view(-1)
-        y_flat = y.view(-1)
-        nbytes = token_bytes[y_flat]
-        mask = nbytes > 0
-        total_nats += (loss_flat * mask).sum().item()
-        total_bytes += nbytes.sum().item()
-    return total_nats / (math.log(2) * total_bytes)
+    build_seconds = 0.0
+
+    if not skip_build:
+        success, build_seconds = build_app()
+        if not success:
+            return None
+
+    if not install_app():
+        return None
+
+    metrics, all_runs = measure_launch(num_runs)
+    if metrics is None:
+        return None
+
+    metrics["build_seconds"] = round(build_seconds, 1)
+    metrics["composite_score"] = compute_composite_score(metrics)
+    metrics["all_runs"] = all_runs
+    return metrics
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Prepare data and tokenizer for autoresearch")
-    parser.add_argument("--num-shards", type=int, default=10, help="Number of training shards to download (-1 = all). Val shard is always pinned.")
-    parser.add_argument("--download-workers", type=int, default=8, help="Number of parallel download workers")
+    parser = argparse.ArgumentParser(
+        description="iOS app launch performance harness"
+    )
+    parser.add_argument(
+        "--runs", type=int, default=DEFAULT_RUNS,
+        help=f"Number of measurement runs (default: {DEFAULT_RUNS})"
+    )
+    parser.add_argument(
+        "--skip-build", action="store_true",
+        help="Skip the build step (measure existing install)"
+    )
     args = parser.parse_args()
 
-    num_shards = MAX_SHARD if args.num_shards == -1 else args.num_shards
-
-    print(f"Cache directory: {CACHE_DIR}")
+    print(f"Target:     {TARGET_PATH}")
+    print(f"Bundle ID:  {BUNDLE_ID}")
+    print(f"Simulator:  {DEVICE_UDID}")
+    print(f"Runs:       {args.runs}")
     print()
 
-    # Step 1: Download data
-    download_data(num_shards, download_workers=args.download_workers)
-    print()
+    result = evaluate(num_runs=args.runs, skip_build=args.skip_build)
 
-    # Step 2: Train tokenizer
-    train_tokenizer()
+    if result is None:
+        print("\n--- EVALUATION FAILED ---")
+        sys.exit(1)
+
+    cold = result["cold_launch_ms"]
+    reg = result.get("service_registration_ms", 0)
+    swd = result.get("swiftdata_init_ms", 0)
+    score = result["composite_score"]
+    build_s = result["build_seconds"]
+
     print()
-    print("Done! Ready to train.")
+    print("---")
+    print(f"cold_launch_ms:       {cold}")
+    print(f"service_reg_ms:       {reg}")
+    print(f"swiftdata_init_ms:    {swd}")
+    print(f"composite_score:      {score}")
+    print(f"build_seconds:        {build_s}")

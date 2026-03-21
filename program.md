@@ -1,64 +1,85 @@
-# autoresearch
+# autoresearch — iOS cold launch optimization
 
-This is an experiment to have the LLM do its own research.
+This is an experiment to have an LLM optimize iOS app cold launch time autonomously.
 
 ## Setup
 
 To set up a new experiment, work with the user to:
 
-1. **Agree on a run tag**: propose a tag based on today's date (e.g. `mar5`). The branch `autoresearch/<tag>` must not already exist — this is a fresh run.
+1. **Agree on a run tag**: propose a tag based on today's date (e.g. `mar22`). The branch `autoresearch/<tag>` must not already exist — this is a fresh run.
 2. **Create the branch**: `git checkout -b autoresearch/<tag>` from current master.
-3. **Read the in-scope files**: The repo is small. Read these files for full context:
+3. **Read the in-scope files**: Read these files for full context:
    - `README.md` — repository context.
-   - `prepare.py` — fixed constants, data prep, tokenizer, dataloader, evaluation. Do not modify.
-   - `train.py` — the file you modify. Model architecture, optimizer, training loop.
-4. **Verify data exists**: Check that `~/.cache/autoresearch/` contains data shards and a tokenizer. If not, tell the human to run `uv run prepare.py`.
+   - `prepare.py` — fixed harness: build, install, measure, score. Do not modify.
+   - The 5 mutable Swift files in the target app (listed below).
+4. **Verify the target app**: Check that `/Users/alp/Development/Apps/iOS/MiddleEarth` exists and has a `Project.swift` or `MiddleEarth.xcworkspace`. If the workspace is missing, run `cd /Users/alp/Development/Apps/iOS/MiddleEarth && tuist generate --no-open`.
 5. **Initialize results.tsv**: Create `results.tsv` with just the header row. The baseline will be recorded after the first run.
 6. **Confirm and go**: Confirm setup looks good.
 
 Once you get confirmation, kick off the experimentation.
 
+## Target app
+
+- **Path**: `/Users/alp/Development/Apps/iOS/MiddleEarth`
+- **Workspace**: `MiddleEarth.xcworkspace`
+- **Scheme**: `MiddleEarth`
+- **Bundle ID**: `me.alp.middleearth`
+- **Simulator**: iPhone 17 Pro (UDID: `231ABE22-DA2D-4348-AB47-781009F53A63`)
+
+### Files you can modify
+
+These are the only files you may edit. They live under `/Users/alp/Development/Apps/iOS/MiddleEarth/`:
+
+1. `MiddleEarth/Core/DependencyInjection/AppRegistry.swift` — service container setup
+2. `MiddleEarth/MiddleEarthApp.swift` — SwiftUI App entry point
+3. `MiddleEarth/Views/MainView.swift` — root view after splash
+4. `MiddleEarth/Views/Common/SplashView.swift` — splash/loading screen
+5. `MiddleEarth/Services/AppBootstrapService.swift` — startup orchestration
+
+### Baseline metrics
+
+```
+cold_launch_ms:       558
+service_reg_ms:       70
+swiftdata_init_ms:    56
+```
+
 ## Experimentation
 
-Each experiment runs on a single GPU. The training script runs for a **fixed time budget of 5 minutes** (wall clock training time, excluding startup/compilation). You launch it simply as: `uv run train.py`.
+Each experiment builds the app and measures cold launch on the simulator. You launch measurement simply as: `python prepare.py > run.log 2>&1`
 
 **What you CAN do:**
-- Modify `train.py` — this is the only file you edit. Everything is fair game: model architecture, optimizer, hyperparameters, training loop, batch size, model size, etc.
+- Modify the 5 Swift files listed above. Everything is fair game: lazy initialization, dependency injection order, async loading, deferred work, prewarming, caching, SwiftData configuration, view hierarchy restructuring, etc.
 
 **What you CANNOT do:**
-- Modify `prepare.py`. It is read-only. It contains the fixed evaluation, data loading, tokenizer, and training constants (time budget, sequence length, etc).
-- Install new packages or add dependencies. You can only use what's already in `pyproject.toml`.
-- Modify the evaluation harness. The `evaluate_bpb` function in `prepare.py` is the ground truth metric.
+- Modify `prepare.py`. It is read-only. It contains the fixed build, measurement, and scoring logic.
+- Add new Swift files or new dependencies. Work within the existing file structure.
+- Modify files outside the 5 listed above.
+- Break the app's functionality. The app must still launch, display its UI, and work correctly.
 
-**The goal is simple: get the lowest val_bpb.** Since the time budget is fixed, you don't need to worry about training time — it's always 5 minutes. Everything is fair game: change the architecture, the optimizer, the hyperparameters, the batch size, the model size. The only constraint is that the code runs without crashing and finishes within the time budget.
+**The goal is simple: get the lowest cold_launch_ms.** This is the primary metric, analogous to val_bpb in the original autoresearch. Lower is better.
 
-**VRAM** is a soft constraint. Some increase is acceptable for meaningful val_bpb gains, but it should not blow up dramatically.
+**composite_score** is a secondary metric that also accounts for service_registration_ms and swiftdata_init_ms. It's reported for the dashboard but cold_launch_ms is what determines keep/discard.
 
-**Simplicity criterion**: All else being equal, simpler is better. A small improvement that adds ugly complexity is not worth it. Conversely, removing something and getting equal or better results is a great outcome — that's a simplification win. When evaluating whether to keep a change, weigh the complexity cost against the improvement magnitude. A 0.001 val_bpb improvement that adds 20 lines of hacky code? Probably not worth it. A 0.001 val_bpb improvement from deleting code? Definitely keep. An improvement of ~0 but much simpler code? Keep.
-
-**The first run**: Your very first run should always be to establish the baseline, so you will run the training script as is.
+**App correctness** is a hard constraint. If the app crashes on launch or fails to display its UI, that's a failed experiment regardless of timing.
 
 ## Output format
 
-Once the script finishes it prints a summary like this:
+Once `prepare.py` finishes it prints a summary like this:
 
 ```
 ---
-val_bpb:          0.997900
-training_seconds: 300.1
-total_seconds:    325.9
-peak_vram_mb:     45060.2
-mfu_percent:      39.80
-total_tokens_M:   499.6
-num_steps:        953
-num_params_M:     50.3
-depth:            8
+cold_launch_ms:       392
+service_reg_ms:       31
+swiftdata_init_ms:    42
+composite_score:      0.8022
+build_seconds:        18.5
 ```
 
-Note that the script is configured to always stop after 5 minutes, so depending on the computing platform of this computer the numbers might look different. You can extract the key metric from the log file:
+You can extract the key metric from the log file:
 
 ```
-grep "^val_bpb:" run.log
+grep "^cold_launch_ms:" run.log
 ```
 
 ## Logging results
@@ -68,47 +89,73 @@ When an experiment is done, log it to `results.tsv` (tab-separated, NOT comma-se
 The TSV has a header row and 5 columns:
 
 ```
-commit	val_bpb	memory_gb	status	description
+commit	cold_launch_ms	composite_score	status	description
 ```
 
-1. git commit hash (short, 7 chars)
-2. val_bpb achieved (e.g. 1.234567) — use 0.000000 for crashes
-3. peak memory in GB, round to .1f (e.g. 12.3 — divide peak_vram_mb by 1024) — use 0.0 for crashes
+1. git commit hash (short, 7 chars) — this is the commit in the target app repo
+2. cold_launch_ms achieved (e.g. 392) — use 0 for crashes
+3. composite_score (e.g. 0.8022) — use 0.0000 for crashes
 4. status: `keep`, `discard`, or `crash`
 5. short text description of what this experiment tried
 
 Example:
 
 ```
-commit	val_bpb	memory_gb	status	description
-a1b2c3d	0.997900	44.0	keep	baseline
-b2c3d4e	0.993200	44.2	keep	increase LR to 0.04
-c3d4e5f	1.005000	44.0	discard	switch to GeLU activation
-d4e5f6g	0.000000	0.0	crash	double model width (OOM)
+commit	cold_launch_ms	composite_score	status	description
+a1b2c3d	558	1.0000	keep	baseline
+b2c3d4e	392	1.2500	keep	lazy service registration
+c3d4e5f	610	0.9100	discard	eager preloading (slower)
+d4e5f6g	0	0.0000	crash	removed required init (crash on launch)
 ```
 
 ## The experiment loop
 
-The experiment runs on a dedicated branch (e.g. `autoresearch/mar5` or `autoresearch/mar5-gpu0`).
+The experiment runs on a dedicated branch (e.g. `autoresearch/mar22`).
 
 LOOP FOREVER:
 
-1. Look at the git state: the current branch/commit we're on
-2. Tune `train.py` with an experimental idea by directly hacking the code.
-3. git commit
-4. Run the experiment: `uv run train.py > run.log 2>&1` (redirect everything — do NOT use tee or let output flood your context)
-5. Read out the results: `grep "^val_bpb:\|^peak_vram_mb:" run.log`
-6. If the grep output is empty, the run crashed. Run `tail -n 50 run.log` to read the Python stack trace and attempt a fix. If you can't get things to work after more than a few attempts, give up.
-7. Record the results in the tsv (NOTE: do not commit the results.tsv file, leave it untracked by git)
-8. If val_bpb improved (lower), you "advance" the branch, keeping the git commit
-9. If val_bpb is equal or worse, you git reset back to where you started
+1. Look at the state of the 5 mutable Swift files
+2. Form a hypothesis about what change might reduce cold launch time
+3. Edit the Swift file(s) in the target app
+4. git commit (in the target app repo)
+5. Run the measurement: `python /Users/alp/Development/autoresearch/prepare.py > run.log 2>&1`
+6. Read out the results: `grep "^cold_launch_ms:\|^composite_score:" run.log`
+7. If the grep output is empty, the run failed. Run `tail -n 50 run.log` to read the error and attempt a fix.
+8. Record the results in results.tsv (NOTE: do not commit results.tsv, leave it untracked by git)
+9. If cold_launch_ms improved (lower), you "advance", keeping the change
+10. If cold_launch_ms is equal or worse, revert the Swift file changes (`git checkout -- <files>` in the target app repo)
 
-The idea is that you are a completely autonomous researcher trying things out. If they work, keep. If they don't, discard. And you're advancing the branch so that you can iterate. If you feel like you're getting stuck in some way, you can rewind but you should probably do this very very sparingly (if ever).
+## Optimization strategies to try
 
-**Timeout**: Each experiment should take ~5 minutes total (+ a few seconds for startup and eval overhead). If a run exceeds 10 minutes, kill it and treat it as a failure (discard and revert).
+Here are some ideas, roughly ordered by expected impact:
 
-**Crashes**: If a run crashes (OOM, or a bug, or etc.), use your judgment: If it's something dumb and easy to fix (e.g. a typo, a missing import), fix it and re-run. If the idea itself is fundamentally broken, just skip it, log "crash" as the status in the tsv, and move on.
+### High impact
+- **Lazy service registration**: Defer non-essential services until after first frame
+- **Async bootstrap**: Move heavy init work off the main thread
+- **Deferred SwiftData**: Initialize ModelContainer lazily or on background thread
+- **View hierarchy simplification**: Flatten deep view hierarchies in MainView
+- **Splash screen as launch screen**: Use a static splash that doesn't depend on services
 
-**NEVER STOP**: Once the experiment loop has begun (after the initial setup), do NOT pause to ask the human if you should continue. Do NOT ask "should I keep going?" or "is this a good stopping point?". The human might be asleep, or gone from a computer and expects you to continue working *indefinitely* until you are manually stopped. You are autonomous. If you run out of ideas, think harder — read papers referenced in the code, re-read the in-scope files for new angles, try combining previous near-misses, try more radical architectural changes. The loop runs until the human interrupts you, period.
+### Medium impact
+- **Service registration ordering**: Register critical-path services first
+- **Reduce import overhead**: Minimize work done at module load time
+- **Cache warm-up deferral**: Move any cache preloading to post-launch
+- **Background thread init**: Use Task.detached for non-UI initialization
 
-As an example use case, a user might leave you running while they sleep. If each experiment takes you ~5 minutes then you can run approx 12/hour, for a total of about 100 over the duration of the average human sleep. The user then wakes up to experimental results, all completed by you while they slept!
+### Lower impact / experimental
+- **Precomputed layouts**: Cache initial layout calculations
+- **Reduce property wrappers**: Minimize @StateObject/@EnvironmentObject at launch
+- **Static type registration**: Replace runtime reflection with static registration
+- **Combine publisher optimization**: Reduce publisher chain setup at init time
+
+## Timeout
+
+Each experiment should take ~1-2 minutes for the build + 3 launches. If a run exceeds 5 minutes total, kill it and treat it as a failure.
+
+## Crashes
+
+If a run crashes (build failure, runtime crash, etc.), use your judgment: If it's a typo or simple fix, correct and re-run. If the approach is fundamentally broken, skip it, log "crash", and move on.
+
+## NEVER STOP
+
+Once the experiment loop has begun (after the initial setup), do NOT pause to ask the human if you should continue. Do NOT ask "should I keep going?" or "is this a good stopping point?". The human might be asleep or away and expects you to continue working *indefinitely* until you are manually stopped. You are autonomous. If you run out of ideas, think harder — re-read the Swift files for new angles, try combining previous near-misses, try more radical restructuring. The loop runs until the human interrupts you, period.

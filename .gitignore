@@ -1,23 +1,28 @@
-# Python-generated files
+# Python
 __pycache__/
 *.py[oc]
 build/
 dist/
 wheels/
 *.egg-info
-
-# Virtual environments
 .venv
-worktrees/
-results/
-queue/
 
-# Agent prompt files (generated per-session by launchers)
+# Derived data (xcodebuild output)
+Derived/
+
+# Experiment results (per-model histories)
+results/
+
+# Logs
+*.log
+run.log
+
+# Agent prompt files (generated per-session)
 CLAUDE.md
 AGENTS.md
 
-# Experimental code/artifacts
-dev/
-
 # Results file
 results.tsv
+
+# Removed from original
+uv.lock
