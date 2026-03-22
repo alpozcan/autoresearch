@@ -28,13 +28,13 @@ from pathlib import Path
 
 MODELS = [
     {
-        "id": "anthropic/claude-opus-4-6",
+        "id": "anthropic/claude-opus-4.6",
         "short": "claude-opus",
-        "cost_per_1m_input": 15.00,
-        "cost_per_1m_output": 75.00,
+        "cost_per_1m_input": 5.00,
+        "cost_per_1m_output": 25.00,
     },
     {
-        "id": "anthropic/claude-sonnet-4-6",
+        "id": "anthropic/claude-sonnet-4.6",
         "short": "claude-sonnet",
         "cost_per_1m_input": 3.00,
         "cost_per_1m_output": 15.00,
@@ -54,15 +54,15 @@ MODELS = [
     {
         "id": "deepseek/deepseek-chat-v3-0324",
         "short": "deepseek-v3",
-        "cost_per_1m_input": 0.50,
-        "cost_per_1m_output": 1.50,
+        "cost_per_1m_input": 0.20,
+        "cost_per_1m_output": 0.77,
     },
 ]
 
 AUTORESEARCH_DIR = os.path.dirname(os.path.abspath(__file__))
 TARGET_APP_DIR = "/Users/alp/Development/Apps/iOS/MiddleEarth"
 RESULTS_DIR = os.path.join(AUTORESEARCH_DIR, "results")
-DEFAULT_EXPERIMENTS = 50
+DEFAULT_EXPERIMENTS = 30
 
 MUTABLE_FILES = [
     "MiddleEarth/Core/DependencyInjection/AppRegistry.swift",
