@@ -2,7 +2,10 @@
   "name": "autoresearch-ios",
   "description": "Autonomously optimize iOS app cold launch time using Karpathy's autoresearch pattern. Runs hypothesize → modify → build → measure → keep/discard loops on SwiftUI apps.",
   "version": "1.0.0",
-  "author": "Alp Özcan",
+  "author": {
+    "name": "Alp Özcan",
+    "url": "https://github.com/alpozcan"
+  },
   "homepage": "https://github.com/alpozcan/autoresearch",
   "license": "MIT"
 }
