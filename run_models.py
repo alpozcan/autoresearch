@@ -40,12 +40,6 @@ MODELS = [
         "cost_per_1m_output": 15.00,
     },
     {
-        "id": "google/gemini-2.5-pro",
-        "short": "gemini-pro",
-        "cost_per_1m_input": 1.25,
-        "cost_per_1m_output": 10.00,
-    },
-    {
         "id": "openai/gpt-4.1",
         "short": "gpt-4.1",
         "cost_per_1m_input": 2.00,
@@ -56,6 +50,42 @@ MODELS = [
         "short": "deepseek-v3",
         "cost_per_1m_input": 0.20,
         "cost_per_1m_output": 0.77,
+    },
+    {
+        "id": "google/gemini-2.5-pro",
+        "short": "gemini-pro",
+        "cost_per_1m_input": 1.25,
+        "cost_per_1m_output": 10.00,
+    },
+    {
+        "id": "openai/gpt-5.4",
+        "short": "gpt-5.4",
+        "cost_per_1m_input": 2.50,
+        "cost_per_1m_output": 15.00,
+    },
+    {
+        "id": "google/gemini-3.1-pro-preview",
+        "short": "gemini-3.1",
+        "cost_per_1m_input": 2.00,
+        "cost_per_1m_output": 12.00,
+    },
+    {
+        "id": "openai/o3-mini",
+        "short": "o3-mini",
+        "cost_per_1m_input": 1.10,
+        "cost_per_1m_output": 4.40,
+    },
+    {
+        "id": "qwen/qwen-2.5-coder-32b-instruct",
+        "short": "qwen-coder",
+        "cost_per_1m_input": 0.07,
+        "cost_per_1m_output": 0.16,
+    },
+    {
+        "id": "meta-llama/llama-4-maverick",
+        "short": "llama-maverick",
+        "cost_per_1m_input": 0.25,
+        "cost_per_1m_output": 0.99,
     },
 ]
 
@@ -99,7 +129,13 @@ def get_api_key():
 # OpenRouter API
 # ---------------------------------------------------------------------------
 
-def call_openrouter(api_key, model_id, messages, max_tokens=4096):
+DEFAULT_MAX_TOKENS = {
+    "google/gemini-2.5-pro": 16384,  # Gemini is verbose, needs more room
+    "google/gemini-3.1-pro-preview": 16384,  # Same issue as Gemini 2.5 Pro
+    "openai/gpt-5.4": 16384,  # GPT-5.4 also verbose
+}
+
+def call_openrouter(api_key, model_id, messages, max_tokens=None):
     """
     Call OpenRouter API. Returns (response_text, usage_dict, elapsed_seconds).
     """
@@ -107,6 +143,8 @@ def call_openrouter(api_key, model_id, messages, max_tokens=4096):
     import urllib.error
 
     url = "https://openrouter.ai/api/v1/chat/completions"
+    if max_tokens is None:
+        max_tokens = DEFAULT_MAX_TOKENS.get(model_id, 4096)
     payload = json.dumps({
         "model": model_id,
         "messages": messages,
@@ -177,7 +215,7 @@ def apply_patch(response_text, current_files):
 
     Returns (success, files_changed, lines_changed).
     """
-    # Pattern: ```swift or ``` followed by // FILE: <path>
+    # Pattern 1: ```swift followed by // FILE: <path>
     file_pattern = re.compile(
         r"```(?:swift)?\s*\n"
         r"// FILE:\s*(.+?)\s*\n"
@@ -187,8 +225,31 @@ def apply_patch(response_text, current_files):
     )
 
     matches = file_pattern.findall(response_text)
+
+    # Pattern 2: **`path`** or **path** followed by ```swift block (Gemini style)
     if not matches:
-        # Try alternative pattern: just look for full file replacements
+        gemini_pattern = re.compile(
+            r"\*{0,2}`?([A-Za-z][\w/]*\.swift)`?\*{0,2}\s*(?::|\n)\s*"
+            r"```(?:swift)?\s*\n"
+            r"(.*?)"
+            r"```",
+            re.DOTALL,
+        )
+        matches = gemini_pattern.findall(response_text)
+
+    # Pattern 3: filename.swift header line then code block
+    if not matches:
+        header_pattern = re.compile(
+            r"#+\s*`?([A-Za-z][\w/]*\.swift)`?\s*\n+"
+            r"```(?:swift)?\s*\n"
+            r"(.*?)"
+            r"```",
+            re.DOTALL,
+        )
+        matches = header_pattern.findall(response_text)
+
+    # Pattern 4: code blocks that start with import (infer filename from content)
+    if not matches:
         alt_pattern = re.compile(
             r"```(?:swift)?\s*\n"
             r"(.*?)"
@@ -196,8 +257,18 @@ def apply_patch(response_text, current_files):
             re.DOTALL,
         )
         alt_matches = alt_pattern.findall(response_text)
-        if not alt_matches:
-            return False, 0, 0
+        if alt_matches:
+            for block in alt_matches:
+                # Try to identify which file this is by matching unique markers
+                for mf in MUTABLE_FILES:
+                    filename = mf.split("/")[-1].replace(".swift", "")
+                    # Look for struct/class name matching the file
+                    if re.search(rf"\b(struct|class|enum)\s+{filename}\b", block):
+                        matches.append((mf, block))
+                        break
+
+    if not matches:
+        return False, 0, 0
 
     files_changed = 0
     total_lines_changed = 0
@@ -242,11 +313,18 @@ def apply_patch(response_text, current_files):
 
 def run_measurement():
     """Run prepare.py and parse results. Returns metrics dict or None."""
-    result = subprocess.run(
-        [sys.executable, os.path.join(AUTORESEARCH_DIR, "prepare.py")],
-        capture_output=True, text=True, timeout=600,
-        cwd=AUTORESEARCH_DIR,
-    )
+    try:
+        result = subprocess.run(
+            [sys.executable, os.path.join(AUTORESEARCH_DIR, "prepare.py")],
+            capture_output=True, text=True, timeout=600,
+            cwd=AUTORESEARCH_DIR,
+        )
+    except subprocess.TimeoutExpired:
+        print("  prepare.py timed out (600s), treating as crash")
+        # Kill any stuck simulator processes
+        subprocess.run(["xcrun", "simctl", "terminate", "231ABE22-DA2D-4348-AB47-781009F53A63", "me.alp.middleearth"],
+                       capture_output=True, timeout=10)
+        return None
 
     output = result.stdout + "\n" + result.stderr
 
@@ -363,6 +441,8 @@ def run_model_experiments(model_config, api_key, num_experiments):
     total_cost = sum(h.get("cost_usd", 0) for h in history)
     total_input_tokens = sum(h.get("input_tokens", 0) for h in history)
     total_output_tokens = sum(h.get("output_tokens", 0) for h in history)
+    consecutive_failures = 0
+    MAX_CONSECUTIVE_FAILURES = 5  # Stop early if 5 in a row fail to improve
 
     for exp_num in range(start_experiment, start_experiment + num_experiments):
         print(f"\n--- Experiment {exp_num}/{start_experiment + num_experiments - 1} ({model_short}) ---")
@@ -417,7 +497,8 @@ def run_model_experiments(model_config, api_key, num_experiments):
         # Apply patch
         patch_ok, files_changed, lines_changed = apply_patch(response_text, current_files)
         if not patch_ok:
-            print("  No valid file changes found in response, skipping")
+            consecutive_failures += 1
+            print(f"  No valid file changes found in response, skipping [{consecutive_failures}/{MAX_CONSECUTIVE_FAILURES}]")
             entry = {
                 "num": exp_num,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -442,7 +523,8 @@ def run_model_experiments(model_config, api_key, num_experiments):
         metrics = run_measurement()
 
         if metrics is None:
-            print("  Measurement failed, reverting")
+            consecutive_failures += 1
+            print(f"  Measurement failed, reverting [{consecutive_failures}/{MAX_CONSECUTIVE_FAILURES}]")
             restore_mutable_files(backup)
             entry = {
                 "num": exp_num,
@@ -471,6 +553,7 @@ def run_model_experiments(model_config, api_key, num_experiments):
         if cold < best_cold_launch:
             status = "keep"
             best_cold_launch = cold
+            consecutive_failures = 0
             print(f"  KEEP: {cold}ms (improved from {best_cold_launch}ms)")
             # Commit in target app
             subprocess.run(
@@ -483,7 +566,8 @@ def run_model_experiments(model_config, api_key, num_experiments):
             )
         else:
             status = "discard"
-            print(f"  DISCARD: {cold}ms (baseline best: {best_cold_launch}ms)")
+            consecutive_failures += 1
+            print(f"  DISCARD: {cold}ms (baseline best: {best_cold_launch}ms) [{consecutive_failures}/{MAX_CONSECUTIVE_FAILURES} consecutive]")
             restore_mutable_files(backup)
 
         entry = {
@@ -505,6 +589,11 @@ def run_model_experiments(model_config, api_key, num_experiments):
         _save_history(history, history_path)
 
         print(f"  Running total: ${total_cost:.2f} | {total_input_tokens + total_output_tokens:,} tokens")
+
+        # Early stop: 5 consecutive non-keeps = model has converged
+        if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+            print(f"\n  EARLY STOP: {MAX_CONSECUTIVE_FAILURES} consecutive failures, moving to next model")
+            break
 
     # Final summary for this model
     keeps = [h for h in history if h["status"] == "keep"]

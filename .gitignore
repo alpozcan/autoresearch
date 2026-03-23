@@ -6,23 +6,34 @@ dist/
 wheels/
 *.egg-info
 .venv
+.env
 
 # Derived data (xcodebuild output)
 Derived/
 
-# Experiment results (per-model histories)
-results/
-
 # Logs
 *.log
-run.log
 
 # Agent prompt files (generated per-session)
 CLAUDE.md
 AGENTS.md
 
-# Results file
+# Results file (legacy)
 results.tsv
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Secrets
+*.key
+*.env
 
 # Removed from original
 uv.lock

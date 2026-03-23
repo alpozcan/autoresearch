@@ -18,6 +18,8 @@ from datetime import datetime
 AUTORESEARCH_DIR = os.path.dirname(os.path.abspath(__file__))
 RESULTS_DIR = os.path.join(AUTORESEARCH_DIR, "results")
 BASELINE_COLD_LAUNCH = 558
+# Actual OpenRouter spend (includes truncation-phase tokens not tracked per-experiment)
+ACTUAL_OPENROUTER_SPEND = 12.28
 
 MODELS = [
     {"short": "claude-opus", "color": "#7c3aed"},
@@ -25,6 +27,11 @@ MODELS = [
     {"short": "gemini-pro", "color": "#059669"},
     {"short": "gpt-4.1", "color": "#d97706"},
     {"short": "deepseek-v3", "color": "#dc2626"},
+    {"short": "gpt-5.4", "color": "#ef4444"},
+    {"short": "gemini-3.1", "color": "#14b8a6"},
+    {"short": "o3-mini", "color": "#f97316"},
+    {"short": "qwen-coder", "color": "#8b5cf6"},
+    {"short": "llama-maverick", "color": "#ec4899"},
 ]
 
 
@@ -48,6 +55,7 @@ def build_html():
     models_json = json.dumps(MODELS)
     data_json = json.dumps(all_data)
 
+    actual_spend = ACTUAL_OPENROUTER_SPEND
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -59,22 +67,22 @@ def build_html():
 <style>
   * {{ margin: 0; padding: 0; box-sizing: border-box; }}
   body {{ font-family: -apple-system, BlinkMacSystemFont, 'SF Pro', system-ui, sans-serif;
-         background: #0a0a0a; color: #e5e5e5; padding: 20px; }}
+         background: #ffffff; color: #1e293b; padding: 20px; }}
   h1 {{ font-size: 1.5rem; font-weight: 600; margin-bottom: 4px; }}
   .subtitle {{ color: #737373; font-size: 0.85rem; margin-bottom: 20px; }}
   .grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 16px; }}
-  .card {{ background: #171717; border: 1px solid #262626; border-radius: 12px; padding: 16px; }}
+  .card {{ background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 12px; padding: 16px; }}
   .card-title {{ font-size: 0.8rem; color: #737373; text-transform: uppercase;
                  letter-spacing: 0.05em; margin-bottom: 8px; }}
   .full-width {{ grid-column: 1 / -1; }}
   table {{ width: 100%; border-collapse: collapse; font-size: 0.85rem; }}
-  th {{ text-align: left; padding: 8px 12px; color: #737373; border-bottom: 1px solid #262626;
+  th {{ text-align: left; padding: 8px 12px; color: #737373; border-bottom: 1px solid #e2e8f0;
         font-weight: 500; }}
-  td {{ padding: 8px 12px; border-bottom: 1px solid #1a1a1a; }}
+  td {{ padding: 8px 12px; border-bottom: 1px solid #f1f5f9; }}
   .badge {{ display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem; }}
-  .badge-keep {{ background: #052e16; color: #4ade80; }}
-  .badge-discard {{ background: #1c1917; color: #a8a29e; }}
-  .badge-crash {{ background: #450a0a; color: #f87171; }}
+  .badge-keep {{ background: #dcfce7; color: #166534; }}
+  .badge-discard {{ background: #f5f5f4; color: #78716c; }}
+  .badge-crash {{ background: #fef2f2; color: #dc2626; }}
   .stat-value {{ font-size: 1.8rem; font-weight: 700; }}
   .stat-label {{ font-size: 0.75rem; color: #737373; }}
   .model-dot {{ display: inline-block; width: 10px; height: 10px; border-radius: 50%;
@@ -92,7 +100,7 @@ def build_html():
 
 <div class="grid">
   <div class="card full-width">
-    <div class="card-title">Score Timeline</div>
+    <div class="card-title">Cold Launch Over Time (lower = better)</div>
     <div id="timeline"></div>
   </div>
 </div>
@@ -101,6 +109,22 @@ def build_html():
   <div class="card full-width">
     <div class="card-title">Best Cold Launch by Model</div>
     <div id="comparison"></div>
+  </div>
+</div>
+
+<div class="grid">
+  <div class="card full-width">
+    <div class="card-title">Scoring Formula</div>
+    <div style="padding: 12px 0; font-size: 0.9rem; color: #475569; line-height: 1.8;">
+      <p style="margin-bottom: 8px;"><strong>Composite Score</strong> = weighted average of (baseline / measured) ratios. <strong>Higher = better.</strong> 1.0 = baseline performance.</p>
+      <code style="background: #f1f5f9; padding: 8px 14px; border-radius: 6px; display: inline-block; font-size: 0.85rem; color: #334155;">
+        score = 0.30 &times; (558 / cold_launch) + 0.15 &times; (70 / service_reg) + 0.10 &times; (56 / swiftdata_init)
+      </code>
+      <p style="margin-top: 8px; color: #94a3b8; font-size: 0.8rem;">
+        Weights: Cold Launch 30% &middot; Service Registration 15% &middot; SwiftData Init 10% &middot; Remaining 45% unchanged from baseline.
+        <br>The timeline chart above shows <strong>cold_launch_ms</strong> (lower = faster). The Score column in tables shows the composite metric (higher = better).
+      </p>
+    </div>
   </div>
 </div>
 
@@ -150,6 +174,7 @@ def build_html():
 const MODELS = {models_json};
 const DATA = {data_json};
 const BASELINE = {BASELINE_COLD_LAUNCH};
+const ACTUAL_SPEND = {actual_spend};
 
 // --- Stats cards ---
 const statsGrid = document.getElementById('stats-grid');
@@ -175,7 +200,7 @@ const stats = [
   {{ label: 'Total Experiments', value: totalExperiments }},
   {{ label: 'Best Cold Launch', value: globalBest + 'ms' }},
   {{ label: 'Improvement', value: improvement + '%' }},
-  {{ label: 'Total Cost', value: '$' + totalCost.toFixed(2) }},
+  {{ label: 'Total Cost', value: '$' + ACTUAL_SPEND.toFixed(2) }},
 ];
 stats.forEach(s => {{
   const card = document.createElement('div');
@@ -190,7 +215,7 @@ MODELS.forEach(m => {{
   const history = DATA[m.short] || [];
   if (history.length === 0) return;
   let runningBest = BASELINE;
-  const x = [], y = [];
+  const x = [0], y = [BASELINE]; // Start all models from baseline
   history.forEach(h => {{
     if (h.status === 'keep' && h.cold_launch_ms > 0) {{
       runningBest = Math.min(runningBest, h.cold_launch_ms);
@@ -213,10 +238,10 @@ timelineTraces.push({{
 }});
 
 Plotly.newPlot('timeline', timelineTraces, {{
-  paper_bgcolor: '#171717', plot_bgcolor: '#171717',
+  paper_bgcolor: '#ffffff', plot_bgcolor: '#f8fafc',
   font: {{ color: '#a3a3a3', size: 11 }},
-  xaxis: {{ title: 'Experiment #', gridcolor: '#262626' }},
-  yaxis: {{ title: 'Best Cold Launch (ms)', gridcolor: '#262626' }},
+  xaxis: {{ title: 'Experiment Number (each = build + 3 cold launches)', gridcolor: '#e2e8f0' }},
+  yaxis: {{ title: 'Best Cold Launch Time in ms (lower = faster)', gridcolor: '#e2e8f0' }},
   legend: {{ orientation: 'h', y: -0.2 }},
   margin: {{ t: 10, r: 20, b: 60, l: 60 }},
 }}, {{ responsive: true }});
@@ -238,9 +263,9 @@ Plotly.newPlot('comparison', [{{
   text: compY.map(v => v + 'ms'), textposition: 'outside',
   textfont: {{ color: '#a3a3a3' }},
 }}], {{
-  paper_bgcolor: '#171717', plot_bgcolor: '#171717',
+  paper_bgcolor: '#ffffff', plot_bgcolor: '#f8fafc',
   font: {{ color: '#a3a3a3', size: 11 }},
-  yaxis: {{ title: 'Cold Launch (ms)', gridcolor: '#262626' }},
+  yaxis: {{ title: 'Cold Launch (ms)', gridcolor: '#e2e8f0' }},
   margin: {{ t: 10, r: 20, b: 40, l: 60 }},
   shapes: [{{
     type: 'line', x0: -0.5, x1: compX.length - 0.5,
