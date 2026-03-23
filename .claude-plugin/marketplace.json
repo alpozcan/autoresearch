@@ -7,7 +7,7 @@
   "plugins": [
     {
       "name": "autoresearch-ios",
-      "source": "..",
+      "source": "./plugins/autoresearch-ios",
       "description": "Autonomously optimize iOS app cold launch time using Karpathy's autoresearch pattern",
       "version": "1.0.0"
     }
