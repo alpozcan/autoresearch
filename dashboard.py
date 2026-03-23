@@ -19,7 +19,7 @@ AUTORESEARCH_DIR = os.path.dirname(os.path.abspath(__file__))
 RESULTS_DIR = os.path.join(AUTORESEARCH_DIR, "results")
 BASELINE_COLD_LAUNCH = 558
 # Actual OpenRouter spend (includes truncation-phase tokens not tracked per-experiment)
-ACTUAL_OPENROUTER_SPEND = 12.28
+ACTUAL_OPENROUTER_SPEND = 17.05
 
 MODELS = [
     {"short": "claude-opus", "color": "#7c3aed"},

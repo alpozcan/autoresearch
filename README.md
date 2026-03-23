@@ -18,7 +18,7 @@ A fork of [karpathy/autoresearch](https://github.com/karpathy/autoresearch) adap
 | Claude Sonnet 4.6 | 353ms | -37% | 30 | 3 | $1.50 |
 | GPT-4.1 | 413ms | -26% | 11 | 4 | $0.27 |
 
-**Total: ~117 experiments across 5 models for $12.28 on [OpenRouter](https://openrouter.ai).**
+**Total: ~117 experiments across 5 models for $17.05 on [OpenRouter](https://openrouter.ai).**
 
 <!-- TODO: Add chart screenshots after all models finish -->
 <!-- ![Cold Launch Over Time](assets/timeline.png) -->
