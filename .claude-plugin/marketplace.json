@@ -1,0 +1,15 @@
+{
+  "name": "autoresearch-marketplace",
+  "owner": {
+    "name": "Alp Özcan",
+    "url": "https://github.com/alpozcan"
+  },
+  "plugins": [
+    {
+      "name": "autoresearch-ios",
+      "source": ".",
+      "description": "Autonomously optimize iOS app cold launch time using Karpathy's autoresearch pattern",
+      "version": "1.0.0"
+    }
+  ]
+}
